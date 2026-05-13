@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /agent/sign`**: detached ML-DSA-65 signature over a caller-supplied payload using the running agent's signing key. Bearer-token authenticated; payloads are capped at 256 KiB. Response includes the agent_id (hex), the agent's public key (base64), the signature (base64), and an algorithm identifier (`"ML-DSA-65"`). Intended for applications that persist signed records to disk or distributed storage (audit logs, governance votes, content metadata) where transport-layer gossip signing doesn't survive a database read. Matching CLI: `x0x agent sign --file <PATH>` (or `--payload-b64 <BASE64>`). Coverage: `daemon_api_agent_sign_*` integration tests + `api_coverage` registry entry.
+
 ## [v0.19.42] - 2026-05-12
 
 Phase 2 portfolio release: SOTA-Borrow Phase 2 work shipped via the
