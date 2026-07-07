@@ -94,6 +94,11 @@ enum WsOutbound {
         received_at: u64,
         verified: bool,
         trust_decision: Option<String>,
+        /// Opt-in masked origin token ([`crate::observed_prefix`]). Absent
+        /// (not `null`) unless the daemon sets `observed_prefix_enabled =
+        /// true` — old clients see byte-identical frames by default.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observed_prefix: Option<crate::observed_prefix::ObservedPrefix>,
     },
     #[serde(rename = "subscribed")]
     Subscribed { topics: Vec<String> },
@@ -427,6 +432,7 @@ async fn handle_ws_connection(
                     received_at: msg.received_at,
                     verified: msg.verified,
                     trust_decision: msg.trust_decision.map(|d| d.to_string()),
+                    observed_prefix: msg.observed_prefix,
                 };
                 // DMs are fire-and-forget (DirectSubscriberQueue, drop-oldest,
                 // 8192 deep — no retaining inbox behind subscribe_direct), so a
@@ -808,6 +814,75 @@ mod tests {
     // counters, so it is fully deterministic and daemon-free. These are the
     // CI-gating regression net for the slow-consumer policy.
     // ========================================================================
+
+    // ========================================================================
+    // Observed-prefix (opt-in masked origin token) WS frame shape.
+    //
+    // WHY: default-OFF is a wire-compatibility + privacy guarantee — with the
+    // flag off the `direct_message` frame must be byte-identical to
+    // pre-feature builds (key entirely absent, not null); with it on the
+    // token must carry only the MASKED prefix, never a raw IP.
+    // ========================================================================
+
+    #[test]
+    fn direct_message_frame_omits_observed_prefix_when_none() {
+        let out = WsOutbound::DirectMessage {
+            sender: "aa".into(),
+            machine_id: "bb".into(),
+            payload: "cGF5bG9hZA==".into(),
+            received_at: 1,
+            verified: true,
+            trust_decision: None,
+            observed_prefix: None,
+        };
+        let json = serde_json::to_value(&out).expect("serializes");
+        assert!(
+            json.get("observed_prefix").is_none(),
+            "observed_prefix key must be entirely absent when disabled, got: {json}"
+        );
+        // Exact legacy shape — old clients see the same set of keys.
+        let keys: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .expect("object frame")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "type",
+            "sender",
+            "machine_id",
+            "payload",
+            "received_at",
+            "verified",
+            "trust_decision",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn direct_message_frame_carries_masked_observed_prefix_when_enabled() {
+        let op = crate::observed_prefix::ObservedPrefix::from_addr(
+            "203.0.113.7:5483".parse().expect("addr"),
+            true,
+        );
+        let out = WsOutbound::DirectMessage {
+            sender: "aa".into(),
+            machine_id: "bb".into(),
+            payload: "cGF5bG9hZA==".into(),
+            received_at: 1,
+            verified: true,
+            trust_decision: None,
+            observed_prefix: Some(op),
+        };
+        let json = serde_json::to_value(&out).expect("serializes");
+        assert_eq!(json["observed_prefix"]["prefix"], "203.0.113.0/24");
+        assert_eq!(json["observed_prefix"]["direct"], true);
+        assert_eq!(json["observed_prefix"]["cgnat"], false);
+        // Never the raw IP anywhere in the rendered frame.
+        assert!(!json.to_string().contains("203.0.113.7"));
+    }
 
     #[tokio::test]
     async fn feed_droppable_sends_and_keeps_feeder_alive_when_room() {

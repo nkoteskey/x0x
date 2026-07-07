@@ -207,7 +207,10 @@ fn is_vpn_egress(ip: IpAddr) -> bool {
 }
 
 /// Whether `ip` is in the RFC 6598 CGNAT range.
-fn is_cgnat(ip: IpAddr) -> bool {
+///
+/// Also consulted by [`crate::observed_prefix`] when coarsening an observed
+/// peer address into a masked origin token.
+pub(crate) fn is_cgnat(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let (net, prefix) = CGNAT_V4_RANGE;

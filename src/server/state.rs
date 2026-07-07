@@ -184,6 +184,17 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) peer_relay: x0x::network::PeerRelayConfig,
 
+    /// Opt-in masked observed-prefix origin tokens on inbound direct
+    /// messages (TOML `observed_prefix_enabled = true`). Default `false`:
+    /// x0x does not expose quasi-geolocation by default (see
+    /// `docs/trust-and-connectivity.md`). When enabled, DM receive events
+    /// (WS/SSE) and the per-peer `/diagnostics/dm` snapshot carry a coarse
+    /// masked CIDR token (`/24` v4, `/48` v6 — never a raw IP) for
+    /// point-to-point paths only; nothing is ever gossiped. See
+    /// [`x0x::observed_prefix`].
+    #[serde(default)]
+    pub observed_prefix_enabled: bool,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -436,6 +447,7 @@ impl Default for DaemonConfig {
             directory_digest_interval_secs: None,
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
+            observed_prefix_enabled: false,
         }
     }
 }

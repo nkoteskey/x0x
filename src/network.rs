@@ -1714,6 +1714,16 @@ impl NetworkNode {
             })
     }
 
+    /// Remote UDP socket address of the live connection to `peer_id`, if any.
+    ///
+    /// Returns `None` when the peer is not in the live connection table or
+    /// when its transport address is not plain UDP. Consumed by the direct-DM
+    /// listener to build an opt-in masked [`crate::observed_prefix`] token —
+    /// the raw address never travels further than that coarsening step.
+    pub(crate) async fn peer_remote_udp_addr(&self, peer_id: &AntPeerId) -> Option<SocketAddr> {
+        self.connected_peer_snapshot(peer_id).await?.0
+    }
+
     fn peer_needs_pre_send_probe(
         health: &ant_quic::ConnectionHealth,
         idle_for: Duration,

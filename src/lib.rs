@@ -104,6 +104,12 @@ pub mod trust;
 /// `ConnectOutcome` for the result of `connect_to_agent()`.
 pub mod connectivity;
 
+/// Coarse, masked, co-observed network-origin tokens ("observed prefix").
+///
+/// Default-OFF privacy-preserving origin-diversity signal for point-to-point
+/// surfaces only (DM receive events, per-peer DM diagnostics). Never gossiped.
+pub mod observed_prefix;
+
 /// Gossip overlay networking for x0x.
 pub mod gossip;
 
@@ -324,6 +330,12 @@ pub struct Agent {
     /// surfacing inbound [`streams::PeerStream`]s that have cleared the
     /// identity gate, plus an idempotent started-flag for the accept loop.
     stream_accept: std::sync::Arc<streams::StreamAccept>,
+    /// Whether to attach a masked [`observed_prefix::ObservedPrefix`] token
+    /// to inbound direct messages (point-to-point surfaces only). Default
+    /// `false`: when disabled nothing is computed and the fields are entirely
+    /// absent from every serialized surface. See the module docs for the
+    /// privacy invariants.
+    observed_prefix_enabled: bool,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -1788,6 +1800,9 @@ pub struct AgentBuilder {
     /// revocations.bin).  When set, revocations are loaded/saved there
     /// instead of the default `~/.x0x/` directory.
     identity_dir: Option<std::path::PathBuf>,
+    /// Opt-in masked observed-prefix tokens on inbound direct messages.
+    /// Default `false` (see [`crate::observed_prefix`]).
+    observed_prefix_enabled: bool,
 }
 
 /// Context captured by the background identity heartbeat task.
@@ -2150,6 +2165,7 @@ impl Agent {
             presence_offline_timeout_secs: None,
             contact_store_path: None,
             identity_dir: None,
+            observed_prefix_enabled: false,
         }
     }
 
@@ -7841,6 +7857,7 @@ impl Agent {
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let observed_prefix_enabled = self.observed_prefix_enabled;
         let token = self.shutdown_token.clone();
 
         self.spawn_tracked(async move {
@@ -7968,9 +7985,35 @@ impl Agent {
                 // Register and mark the sender as connected for future reverse direct sends.
                 dm.mark_connected(sender, machine_id).await;
 
+                // Opt-in (default OFF) masked origin token. Coarsens the
+                // remote address of the live point-to-point connection that
+                // delivered this DM — an address the transport already
+                // observes (bootstrap-cache enrichment, NAT traversal) — to
+                // a /24 (v4) or /48 (v6) prefix. Never a raw IP; never
+                // attached on gossip paths. Relayed DMs re-injected onto
+                // this channel carry the *origin's* peer id, for which no
+                // live connection typically exists, so the lookup yields
+                // `None` and no token is attached — the relay's address is
+                // never misattributed to the origin.
+                let observed_prefix = if observed_prefix_enabled {
+                    network
+                        .peer_remote_udp_addr(&ant_peer_id)
+                        .await
+                        .map(|addr| observed_prefix::ObservedPrefix::from_addr(addr, true))
+                } else {
+                    None
+                };
+
                 // Fan out to all subscribe_direct() receivers with verification info.
                 let delivered = dm
-                    .handle_incoming(machine_id, sender, data, verified, trust_decision)
+                    .handle_incoming_with_origin(
+                        machine_id,
+                        sender,
+                        data,
+                        verified,
+                        trust_decision,
+                        observed_prefix,
+                    )
                     .await;
 
                 tracing::debug!(
@@ -8928,6 +8971,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Opt in to masked observed-prefix tokens on inbound direct messages.
+    ///
+    /// Default `false`. When enabled, each inbound DM received over a live
+    /// point-to-point connection carries a coarse
+    /// [`observed_prefix::ObservedPrefix`] (`/24` v4, `/48` v6 — never a raw
+    /// IP), surfaced on the DM subscriber/WS/SSE events and the per-peer
+    /// `/diagnostics/dm` snapshot. Never gossiped. See
+    /// [`crate::observed_prefix`] for the privacy invariants.
+    #[must_use]
+    pub fn with_observed_prefix_enabled(mut self, enabled: bool) -> Self {
+        self.observed_prefix_enabled = enabled;
+        self
+    }
+
     /// Build and initialise the agent.
     ///
     /// This performs the following:
@@ -9333,6 +9390,7 @@ impl AgentBuilder {
             peer_relay,
             relay_candidates,
             stream_accept: std::sync::Arc::new(streams::StreamAccept::new(256)),
+            observed_prefix_enabled: self.observed_prefix_enabled,
         })
     }
 }

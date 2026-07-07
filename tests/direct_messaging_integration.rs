@@ -244,6 +244,108 @@ async fn test_send_direct_loopback_delivery_between_agents(
     assert_eq!(received.payload, payload);
     assert_eq!(received.payload_str(), Some("direct-message-success-path"));
     assert!(received.verified);
+    // Observed-prefix is opt-in and neither agent enabled it: the token must
+    // be absent even though a real point-to-point connection delivered this.
+    assert!(received.observed_prefix.is_none());
+
+    Ok(())
+}
+
+/// Opt-in observed-prefix: a real QUIC loopback delivery must surface a
+/// MASKED origin token — never the raw peer address — when (and only when)
+/// the receiving agent enables the flag.
+///
+/// WHY: this is the highest layer the feature can be exercised end-to-end on
+/// a single host (two in-process agents over a genuine QUIC connection). It
+/// proves the coarsening runs against the *live connection's* remote address
+/// observed by the transport, not a synthetic value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_send_direct_loopback_observed_prefix_when_enabled(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new().unwrap();
+    let Some(alice) = create_loopback_test_agent(&temp_dir, "alice_op").await? else {
+        return Ok(());
+    };
+    // Bob (the receiver) opts in to observed-prefix tokens.
+    let bob = match Agent::builder()
+        .with_machine_key(temp_dir.path().join("bob_op_machine.key"))
+        .with_agent_key_path(temp_dir.path().join("bob_op_agent.key"))
+        .with_contact_store_path(temp_dir.path().join("bob_op_contacts.json"))
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config())
+        .with_observed_prefix_enabled(true)
+        .build()
+        .await
+    {
+        Ok(agent) => agent,
+        Err(error) if is_network_bind_permission_error(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    alice.join_network().await?;
+    bob.join_network().await?;
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(alice_network.bound_addr().await.expect("alice bound"));
+    let bob_addr = normalize_loopback(bob_network.bound_addr().await.expect("bob bound"));
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+    let connected = alice_network.connect_addr(bob_addr).await?;
+    assert_eq!(connected.0, bob.machine_id().0);
+
+    let connected_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < connected_deadline {
+        if alice_network.is_connected(&bob_peer).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(alice_network.is_connected(&bob_peer).await);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
+        .await;
+    alice
+        .direct_messaging()
+        .mark_connected(bob.agent_id(), bob.machine_id())
+        .await;
+
+    let payload = b"observed-prefix-path".to_vec();
+    let mut bob_rx = bob.subscribe_direct();
+
+    let receipt = alice.send_direct(&bob.agent_id(), payload.clone()).await?;
+    assert_eq!(receipt.path, x0x::dm::DmPath::RawQuic);
+
+    let received = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("bob should receive direct message")
+        .expect("bob direct subscription remains open");
+    assert_eq!(received.sender, alice.agent_id());
+    assert_eq!(received.payload, payload);
+
+    let op = received
+        .observed_prefix
+        .expect("flag ON + live point-to-point connection must yield a token");
+    // Loopback path: masked /24, direct, not CGNAT — and definitely not the
+    // raw 127.0.0.1 with a host octet or port.
+    assert_eq!(op.prefix, "127.0.0.0/24");
+    assert!(op.direct);
+    assert!(!op.cgnat);
+
+    // The per-peer /diagnostics/dm snapshot records it too.
+    let snap = bob.direct_messaging().diagnostics_snapshot();
+    let peer = &snap.per_peer[&hex::encode(alice.agent_id().as_bytes())];
+    assert_eq!(
+        peer.observed_prefix.as_ref().map(|p| p.prefix.as_str()),
+        Some("127.0.0.0/24")
+    );
 
     Ok(())
 }

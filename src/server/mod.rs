@@ -682,7 +682,8 @@ pub async fn serve_with_options(
         .with_peer_cache_dir(cache_dir)
         .with_contact_store_path(&contacts_path)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
-        .with_identity_ttl(config.identity_ttl_secs);
+        .with_identity_ttl(config.identity_ttl_secs)
+        .with_observed_prefix_enabled(config.observed_prefix_enabled);
 
     if let Some(secs) = config.presence_beacon_interval_secs {
         builder = builder.with_presence_beacon_interval(secs);
@@ -18103,6 +18104,20 @@ mod tests {
         let mut version = semver::Version::parse(x0x::VERSION).expect("current version is semver");
         version.patch += 1;
         version.to_string()
+    }
+
+    #[test]
+    fn observed_prefix_config_flag_defaults_off_and_parses_from_toml() {
+        // WHY: default-OFF is the privacy contract (x0x does not expose
+        // quasi-geolocation unless the operator opts in), and the exact TOML
+        // key is the operator-facing API — both must not drift silently.
+        let default_config: DaemonConfig = toml::from_str("").expect("empty TOML parses");
+        assert!(!default_config.observed_prefix_enabled);
+        assert!(!DaemonConfig::default().observed_prefix_enabled);
+
+        let enabled: DaemonConfig =
+            toml::from_str("observed_prefix_enabled = true").expect("flag TOML parses");
+        assert!(enabled.observed_prefix_enabled);
     }
 
     #[test]

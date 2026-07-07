@@ -643,6 +643,19 @@ Server → client:
 {"type":"error","message":"..."}
 ```
 
+When the daemon opts in with `observed_prefix_enabled = true` in its TOML
+(default **off**), `direct_message` events additionally carry a coarse,
+masked origin token for the point-to-point path the message arrived on —
+never a raw IP (IPv4 masked to `/24`, IPv6 to `/48`), never present on
+gossip-delivered messages, and the key is entirely absent when disabled:
+
+```json
+{"type":"direct_message","sender":"hex64...","machine_id":"hex64...","payload":"aGVsbG8=","received_at":1234567890,"observed_prefix":{"prefix":"203.0.113.0/24","direct":true,"cgnat":false}}
+```
+
+The same optional `observed_prefix` object appears per-peer in
+`GET /diagnostics/dm` when enabled.
+
 ### GUI
 
 | Method | Endpoint | CLI | Purpose |

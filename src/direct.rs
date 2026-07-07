@@ -69,6 +69,7 @@
 use crate::dm::DmPath;
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
+use crate::observed_prefix::ObservedPrefix;
 use crate::trust::TrustDecision;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -226,6 +227,14 @@ pub struct DirectMessage {
     /// When present, reflects the full trust evaluation including contact
     /// store trust level and machine pinning.
     pub trust_decision: Option<TrustDecision>,
+    /// Masked, coarse network-origin token for the point-to-point path this
+    /// message arrived on ([`crate::observed_prefix`]).
+    ///
+    /// `None` unless the daemon opts in (`observed_prefix_enabled = true`) —
+    /// and always `None` for messages that did not arrive over a live direct
+    /// connection (gossip-inbox path, relayed re-injection). Never a raw IP:
+    /// IPv4 is masked to `/24`, IPv6 to `/48`.
+    pub observed_prefix: Option<ObservedPrefix>,
 }
 
 impl DirectMessage {
@@ -256,6 +265,7 @@ impl DirectMessage {
             received_at,
             verified,
             trust_decision,
+            observed_prefix: None,
         }
     }
 
@@ -499,6 +509,9 @@ struct DirectPeerDiagnosticsState {
     send_failed: u64,
     recv_count: u64,
     preferred_path: Option<&'static str>,
+    /// Masked origin token from the most recent inbound DM (opt-in; `None`
+    /// unless the daemon enables `observed_prefix_enabled`). Never a raw IP.
+    observed_prefix: Option<ObservedPrefix>,
 }
 
 impl DirectPeerDiagnosticsState {
@@ -556,6 +569,11 @@ pub struct DmPeerDiagnostics {
     pub send_failed: u64,
     pub recv_count: u64,
     pub preferred_path: String,
+    /// Masked origin token from the most recent inbound DM. Opt-in
+    /// (`observed_prefix_enabled = true` in the daemon TOML) — the key is
+    /// entirely absent when disabled, so default wire behavior is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_prefix: Option<ObservedPrefix>,
 }
 
 /// Snapshot of the direct-message diagnostics surface.
@@ -1027,6 +1045,7 @@ impl DirectMessaging {
                             send_failed: peer.send_failed,
                             recv_count: peer.recv_count,
                             preferred_path: peer.preferred_path.unwrap_or("unknown").to_string(),
+                            observed_prefix: peer.observed_prefix.clone(),
                         },
                     )
                 })
@@ -1084,22 +1103,55 @@ impl DirectMessaging {
         verified: bool,
         trust_decision: Option<TrustDecision>,
     ) -> u64 {
+        self.handle_incoming_with_origin(
+            machine_id,
+            sender_agent_id,
+            payload,
+            verified,
+            trust_decision,
+            None,
+        )
+        .await
+    }
+
+    /// [`handle_incoming`](Self::handle_incoming) plus an optional masked
+    /// origin token ([`crate::observed_prefix`]).
+    ///
+    /// `observed_prefix` is `Some` only when the daemon has opted in
+    /// (`observed_prefix_enabled = true`) **and** the message arrived over a
+    /// live point-to-point connection whose remote address is known. It is
+    /// attached to the fanned-out [`DirectMessage`] and recorded as the
+    /// peer's most recent origin token for the `/diagnostics/dm` snapshot.
+    pub async fn handle_incoming_with_origin(
+        &self,
+        machine_id: MachineId,
+        sender_agent_id: AgentId,
+        payload: Vec<u8>,
+        verified: bool,
+        trust_decision: Option<TrustDecision>,
+        observed_prefix: Option<ObservedPrefix>,
+    ) -> u64 {
         self.diagnostics
             .incoming_envelopes_total
             .fetch_add(1, Ordering::Relaxed);
         let now_ms = now_unix_ms_lossy();
+        let diag_prefix = observed_prefix.clone();
         self.with_peer_diagnostics(sender_agent_id, |peer| {
             peer.last_recv_at_ms = Some(now_ms);
             peer.recv_count = peer.recv_count.saturating_add(1);
+            if diag_prefix.is_some() {
+                peer.observed_prefix = diag_prefix;
+            }
         });
 
-        let msg = DirectMessage::new_verified(
+        let mut msg = DirectMessage::new_verified(
             sender_agent_id,
             machine_id,
             payload,
             verified,
             trust_decision,
         );
+        msg.observed_prefix = observed_prefix;
 
         let subscribers = self.subscriber_snapshot();
         let mut delivered = 0_u64;
@@ -1565,6 +1617,76 @@ mod tests {
         assert_eq!(first.payload, 1_u64.to_be_bytes().to_vec());
         let second = lagging_rx.recv().await.unwrap();
         assert_eq!(second.payload, 2_u64.to_be_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn observed_prefix_flows_to_subscribers_and_diagnostics_when_provided() {
+        // WHY: the origin-diversity token is only trustworthy if it reaches
+        // consumers exactly as the coarsening step produced it — masked,
+        // point-to-point only — and is recorded for /diagnostics/dm.
+        let dm = DirectMessaging::new();
+        let mut rx = dm.subscribe();
+
+        let sender = AgentId([7u8; 32]);
+        let machine_id = MachineId([8u8; 32]);
+        let op = ObservedPrefix::from_addr("203.0.113.99:5483".parse().unwrap(), true);
+
+        dm.handle_incoming_with_origin(
+            machine_id,
+            sender,
+            b"with-origin".to_vec(),
+            true,
+            None,
+            Some(op.clone()),
+        )
+        .await;
+
+        let msg = rx.recv().await.unwrap();
+        let got = msg.observed_prefix.expect("token attached");
+        assert_eq!(got.prefix, "203.0.113.0/24");
+        assert!(got.direct);
+        assert!(!got.cgnat);
+        assert_eq!(got, op);
+
+        // Recorded as the peer's most recent origin token.
+        let snap = dm.diagnostics_snapshot();
+        let peer = &snap.per_peer[&hex::encode(sender.as_bytes())];
+        assert_eq!(peer.observed_prefix.as_ref(), Some(&op));
+
+        // And present in the serialized /diagnostics/dm shape.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(
+            json["per_peer"][hex::encode(sender.as_bytes())]["observed_prefix"]["prefix"],
+            "203.0.113.0/24"
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_prefix_absent_by_default_including_serialized_shapes() {
+        // WHY: default-OFF is a privacy guarantee — when no origin token is
+        // supplied (flag off, or non-point-to-point path) the field must be
+        // None on the message and the key ENTIRELY ABSENT (not null) in the
+        // serialized /diagnostics/dm snapshot, keeping wire behavior
+        // byte-identical to pre-feature builds.
+        let dm = DirectMessaging::new();
+        let mut rx = dm.subscribe();
+
+        let sender = AgentId([9u8; 32]);
+        let machine_id = MachineId([10u8; 32]);
+
+        dm.handle_incoming(machine_id, sender, b"no-origin".to_vec(), true, None)
+            .await;
+
+        let msg = rx.recv().await.unwrap();
+        assert!(msg.observed_prefix.is_none());
+
+        let snap = dm.diagnostics_snapshot();
+        let json = serde_json::to_value(&snap).unwrap();
+        let peer_json = &json["per_peer"][hex::encode(sender.as_bytes())];
+        assert!(
+            peer_json.get("observed_prefix").is_none(),
+            "observed_prefix key must be entirely absent when disabled, got: {peer_json}"
+        );
     }
 
     #[test]

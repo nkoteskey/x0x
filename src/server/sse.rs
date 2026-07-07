@@ -158,7 +158,7 @@ pub(super) async fn direct_events_sse(
                         machine_id = %hex::encode(msg.machine_id.as_bytes()),
                         bytes = msg.payload.len(),
                     );
-                    let data = serde_json::json!({
+                    let mut data = serde_json::json!({
                         "sender": hex::encode(msg.sender.as_bytes()),
                         "machine_id": hex::encode(msg.machine_id.as_bytes()),
                         "payload": BASE64.encode(&msg.payload),
@@ -166,6 +166,11 @@ pub(super) async fn direct_events_sse(
                         "verified": msg.verified,
                         "trust_decision": msg.trust_decision.map(|d| d.to_string())
                     });
+                    // Opt-in masked origin token — key entirely absent (not
+                    // null) when disabled, so default frames are unchanged.
+                    if let Some(op) = &msg.observed_prefix {
+                        data["observed_prefix"] = serde_json::json!(op);
+                    }
                     let event = Event::default()
                         .event("direct_message")
                         .data(data.to_string());
